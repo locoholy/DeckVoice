@@ -46,7 +46,8 @@ command -v parecord >/dev/null && ok "parecord есть" || warn "parecord не�
 echo
 echo "=== 5. Установка ==="
 [ -x "$HOME/.local/bin/deck-dictation" ] && ok "команда deck-dictation доступна" || bad "не установлено → ./install.sh"
-[ -f "$HOME/.local/share/applications/deck-voice-toggle.desktop" ] && ok "ярлык на месте" || warn "ярлыка нет"
+DESK=$(ls "$HOME/.local/share/applications/" 2>/dev/null | grep -E "^deck-(voice|dictation)-toggle\\.desktop$" | head -1)
+if [ -n "$DESK" ]; then ok "ярлык на месте: $DESK"; else warn "ярлыка нет"; fi
 [ -f "$HOME/.config/deck-voice/config" ] && ok "конфиг: ~/.config/deck-voice/config" || warn "конфига нет, работают умолчания"
 
 if grep -q "deck-voice-toggle.desktop\|deck-dictation" "$HOME/.config/kglobalshortcutsrc" 2>/dev/null; then

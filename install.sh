@@ -11,10 +11,16 @@ mkdir -p "$HOME/.local/bin" "$HOME/.local/share/applications" "$HOME/.config/dec
 ln -sf "$SRC/bin/deck-dictation" "$HOME/.local/bin/deck-dictation"
 echo "  запуск:   ~/.local/bin/deck-dictation"
 
+# К имени файла ярлыка привязывается горячая клавиша KDE. Если привязка уже
+# есть на старом имени — пишем в него, иначе потеряется сочетание клавиш.
+DESKTOP_NAME="deck-voice-toggle.desktop"
+if grep -q "deck-dictation-toggle.desktop" "$HOME/.config/kglobalshortcutsrc" 2>/dev/null; then
+    DESKTOP_NAME="deck-dictation-toggle.desktop"
+fi
 sed "s|Exec=.*|Exec=$SRC/bin/deck-dictation|" "$SRC/desktop/deck-voice-toggle.desktop" \
-  > "$HOME/.local/share/applications/deck-voice-toggle.desktop"
+  > "$HOME/.local/share/applications/$DESKTOP_NAME"
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
-echo "  ярлык:    ~/.local/share/applications/deck-voice-toggle.desktop"
+echo "  ярлык:    ~/.local/share/applications/$DESKTOP_NAME"
 
 if [ ! -f "$HOME/.config/deck-voice/config" ]; then
     cp "$SRC/config/deck-voice.conf.example" "$HOME/.config/deck-voice/config"
