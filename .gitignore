@@ -1,0 +1,4 @@
+pylib/
+models/
+*.log
+__pycache__/

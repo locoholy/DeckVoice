@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=🎤 Голос
+Name[ru]=🎤 Голос
+Comment=Тап = старт/стоп голосового ввода
+Exec=/home/deck/Documents/DeckVoice/bin/deck-dictation
+Icon=audio-input-microphone
+Terminal=false
+StartupNotify=false
+NoDisplay=false
+Categories=Utility;
+X-KDE-GlobalAccel-CommandShortcut=true
