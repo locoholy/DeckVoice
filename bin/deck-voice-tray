@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Значок DeckVoice в системном лотке Plasma.
+
+Зачем он нужен. Уведомление — плохой индикатор режима: оно кричит, лезет
+поверх окна и всё равно исчезает. «Идёт запись» — это именно режим, и его
+место в лотке, рядом с громкостью и вайфаем, где живут все прочие
+переключаемые состояния системы. Значок ещё и показывает, каким движком
+прошла последняя диктовка, — по уведомлению этого было не понять.
+
+Почему без Qt и GTK. В SteamOS нет ни PyQt, ни AppIndicator. Значок
+регистрируется напрямую по D-Bus как StatusNotifierItem, меню отдаётся через
+com.canonical.dbusmenu — оба интерфейса Plasma обслуживает штатно.
+
+Почему Gio, а не dbus-python. Меню обязано вернуть массив вариантов (av) со
+структурами внутри, а dbus-python такое не маршалит вообще: он угадывает типы
+и спотыкается. У GVariant сигнатуры задаются явно, поэтому здесь Gio.
+
+Связь с deck-dictation односторонняя и через файлы состояния: демон ничего не
+распознаёт сам, а лишь отражает происходящее и дёргает `deck-dictation toggle`
+по клику. Поэтому если он упадёт, голосовой ввод продолжит работать с горячей
+клавиши — значок не критическая деталь, а удобство.
+"""
+
+import os
+import signal
+import subprocess
+import sys
+
+import gi
+from gi.repository import Gio, GLib
+
+APP = "deck-voice"
+HOME = os.path.expanduser("~")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+STATE_DIR = os.path.join(RUNTIME, "deck-voice")
+STATE_FILE = os.path.join(STATE_DIR, "state")
+LAST_FILE = os.path.join(STATE_DIR, "last")
+PID_FILE = os.path.join(STATE_DIR, "tray.pid")
+CONFIG = os.path.join(HOME, ".config", APP, "config")
+DICTATION = os.path.join(HOME, ".local", "bin", "deck-dictation")
+
+SNI_IFACE = "org.kde.StatusNotifierItem"
+MENU_IFACE = "com.canonical.dbusmenu"
+
+# Значки берём из темы, а не рисуем свои: так они совпадут по стилю с
+# остальным лотком и переживут смену темы оформления.
+ICONS = {
+    "idle": "audio-input-microphone",
+    "recording": "media-record",
+    "working": "view-refresh",
+}
+LABELS = {
+    "idle": "Готов",
+    "recording": "Идёт запись — нажми ещё раз, чтобы остановить",
+    "working": "Распознаю…",
+}
+ENGINE_NAMES = {
+    "auto": "авто (облако, иначе локально)",
+    "cloud": "только облако",
+    "local": "только локально",
+}
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <method name="Activate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="ContextMenu">
+      <arg name="x" type="i" direction="in"/>
+      <arg name="y" type="i" direction="in"/>
+    </method>
+    <method name="Scroll">
+      <arg name="delta" type="i" direction="in"/>
+      <arg name="orientation" type="s" direction="in"/>
+    </method>
+    <signal name="NewIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewTitle"/>
+    <signal name="NewStatus">
+      <arg name="status" type="s"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <method name="GetLayout">
+      <arg name="parentId" type="i" direction="in"/>
+      <arg name="recursionDepth" type="i" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="revision" type="u" direction="out"/>
+      <arg name="layout" type="(ia{sv}av)" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="propertyNames" type="as" direction="in"/>
+      <arg name="properties" type="a(ia{sv})" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="eventId" type="s" direction="in"/>
+      <arg name="data" type="v" direction="in"/>
+      <arg name="timestamp" type="u" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg name="events" type="a(isvu)" direction="in"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg name="id" type="i" direction="in"/>
+      <arg name="needUpdate" type="b" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg name="ids" type="ai" direction="in"/>
+      <arg name="updatesNeeded" type="ai" direction="out"/>
+      <arg name="idErrors" type="ai" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})"/>
+      <arg type="a(ias)"/>
+    </signal>
+    <signal name="LayoutUpdated">
+      <arg type="u"/>
+      <arg type="i"/>
+    </signal>
+    <signal name="ItemActivationRequested">
+      <arg type="i"/>
+      <arg type="u"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+# Свойства обслуживаем сами. Штатный механизм Gio для них требует
+# колбэков-замыканий, а в PyGObject они молча не срабатывают: методы
+# вызываются, а любой запрос свойства падает с «Unable to retrieve property».
+# Через обычный метод всё работает предсказуемо, поэтому объявляем
+# org.freedesktop.DBus.Properties явно и отвечаем на него руками.
+PROPS_XML = """
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg name="interface" type="s" direction="in"/>
+      <arg name="property" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="GetAll">
+      <arg name="interface" type="s" direction="in"/>
+      <arg name="properties" type="a{sv}" direction="out"/>
+    </method>
+    <method name="Set">
+      <arg name="interface" type="s" direction="in"/>
+      <arg name="property" type="s" direction="in"/>
+      <arg name="value" type="v" direction="in"/>
+    </method>
+  </interface>
+</node>
+"""
+
+# Идентификаторы пунктов меню. Держим списком в одном месте, чтобы обработчик
+# клика и построение меню не разъехались.
+M_TOGGLE, M_AUTO, M_CLOUD, M_LOCAL = 1, 3, 4, 5
+M_CHECK, M_CONFIG, M_QUIT = 7, 8, 10
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def run_bg(*args):
+    """Запустить и забыть: демон не должен ждать дочерний процесс."""
+    try:
+        subprocess.Popen(args, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        print(f"не смог запустить {args}: {e}", file=sys.stderr)
+
+
+class Tray:
+    def __init__(self):
+        self.state = "idle"
+        self.revision = 1
+        self.menu_path = "/MenuBar"
+        self.item_path = "/StatusNotifierItem"
+        self.loop = GLib.MainLoop()
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.bus_name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+
+        sni_info = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+
+        props_info = Gio.DBusNodeInfo.new_for_xml(PROPS_XML).interfaces[0]
+
+        self.bus.register_object(self.item_path, sni_info,
+                                 self.on_sni_call, None, None)
+        self.bus.register_object(self.menu_path, menu_info,
+                                 self.on_menu_call, None, None)
+        # Один и тот же обработчик на оба пути: что отдавать, решаем по пути.
+        for path in (self.item_path, self.menu_path):
+            self.bus.register_object(path, props_info,
+                                     self.on_props_call, None, None)
+
+        Gio.bus_own_name_on_connection(
+            self.bus, self.bus_name, Gio.BusNameOwnerFlags.NONE,
+            lambda *_: self.register_with_watcher(),
+            lambda *_: print("имя на шине потеряно", file=sys.stderr))
+
+        self.watch_state()
+        self.claim_pidfile()
+
+    def claim_pidfile(self):
+        """Отмечаемся, чтобы deck-dictation знал: индикатор режима есть,
+        всплывающие плашки о записи можно не показывать."""
+        try:
+            with open(PID_FILE, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError as e:
+            print(f"не смог записать {PID_FILE}: {e}", file=sys.stderr)
+
+    def release_pidfile(self):
+        """Снимаем отметку — иначе после выхода плашки останутся выключенными
+        и о режиме записи не сообщит уже никто."""
+        try:
+            if read(PID_FILE) == str(os.getpid()):
+                os.unlink(PID_FILE)
+        except OSError:
+            pass
+
+    # ── регистрация в лотке ──────────────────────────────────────
+    def register_with_watcher(self):
+        try:
+            self.bus.call_sync(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (self.bus_name,)), None,
+                Gio.DBusCallFlags.NONE, 3000, None)
+        except GLib.Error as e:
+            print(f"лоток не принял значок: {e.message}", file=sys.stderr)
+            self.loop.quit()
+
+    # ── состояние ────────────────────────────────────────────────
+    def watch_state(self):
+        """Следим за каталогом состояния, а не опрашиваем его по таймеру:
+        deck-dictation пишет туда на каждом переходе, ядро будит нас само."""
+        os.makedirs(STATE_DIR, exist_ok=True)
+        self.monitor = Gio.File.new_for_path(STATE_DIR).monitor_directory(
+            Gio.FileMonitorFlags.NONE, None)
+        self.monitor.connect("changed", lambda *_: self.sync())
+        self.sync()
+
+    def engine(self):
+        """Движок читаем из конфига каждый раз: его могли поменять руками."""
+        for line in read(CONFIG).splitlines():
+            line = line.strip()
+            if line.startswith("ENGINE="):
+                return line.split("=", 1)[1].strip().strip('"\'')
+        return "auto"
+
+    def sync(self):
+        new = read(STATE_FILE) or "idle"
+        if new not in ICONS:
+            new = "idle"
+        changed = new != self.state
+        self.state = new
+        if changed:
+            self.emit(self.item_path, SNI_IFACE, "NewIcon", None)
+        self.emit(self.item_path, SNI_IFACE, "NewToolTip", None)
+        self.bump_menu()
+
+    def bump_menu(self):
+        self.revision += 1
+        self.emit(self.menu_path, MENU_IFACE, "LayoutUpdated",
+                  GLib.Variant("(ui)", (self.revision, 0)))
+
+    def emit(self, path, iface, name, params):
+        try:
+            self.bus.emit_signal(None, path, iface, name, params)
+        except GLib.Error as e:
+            print(f"сигнал {name} не ушёл: {e.message}", file=sys.stderr)
+
+    def tooltip(self):
+        parts = [f"Движок: {ENGINE_NAMES.get(self.engine(), self.engine())}"]
+        last = read(LAST_FILE)
+        if last:
+            parts.append(last)
+        return "\n".join(parts)
+
+    # ── значок ───────────────────────────────────────────────────
+    def sni_properties(self):
+        icon = ICONS.get(self.state, ICONS["idle"])
+        return {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", APP),
+            "Title": GLib.Variant("s", "DeckVoice"),
+            "Status": GLib.Variant("s", "Active"),
+            "IconName": GLib.Variant("s", icon),
+            "OverlayIconName": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", ""),
+            "IconThemePath": GLib.Variant("s", ""),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", self.menu_path),
+            "ToolTip": GLib.Variant(
+                "(sa(iiay)ss)",
+                (icon, [], f"DeckVoice — {LABELS.get(self.state, self.state)}",
+                 self.tooltip())),
+        }
+
+    def on_props_call(self, conn, sender, path, iface, method, params,
+                      invocation, data=None):
+        values = (self.menu_properties() if path == self.menu_path
+                  else self.sni_properties())
+        if method == "Get":
+            _iface, prop = params.unpack()
+            value = values.get(prop)
+            if value is None:
+                invocation.return_error_literal(
+                    Gio.dbus_error_quark(),
+                    Gio.DBusError.INVALID_ARGS, f"нет свойства {prop}")
+                return
+            invocation.return_value(GLib.Variant("(v)", (value,)))
+        elif method == "GetAll":
+            invocation.return_value(GLib.Variant("(a{sv})", (values,)))
+        else:
+            invocation.return_value(None)
+
+    def on_sni_call(self, conn, sender, path, iface, method, params,
+                    invocation, data=None):
+        if method in ("Activate", "SecondaryActivate"):
+            self.toggle()
+        invocation.return_value(None)
+
+    # ── меню ─────────────────────────────────────────────────────
+    def items(self):
+        eng = self.engine()
+        rec = self.state == "recording"
+        return [
+            (M_TOGGLE, {
+                "label": ("Остановить запись" if rec else "Начать запись"),
+                "icon-name": ("media-playback-stop" if rec else "media-record")}),
+            (2, {"type": "separator"}),
+            (M_AUTO, {"label": "Авто: облако, иначе локально",
+                      "toggle-type": "radio",
+                      "toggle-state": int(eng == "auto")}),
+            (M_CLOUD, {"label": "Только облако",
+                       "toggle-type": "radio",
+                       "toggle-state": int(eng == "cloud")}),
+            (M_LOCAL, {"label": "Только локально — голос не уходит",
+                       "toggle-type": "radio",
+                       "toggle-state": int(eng == "local")}),
+            (6, {"type": "separator"}),
+            (M_CHECK, {"label": "Проверить облако",
+                       "icon-name": "network-connect"}),
+            (M_CONFIG, {"label": "Открыть настройки", "icon-name": "configure"}),
+            (9, {"type": "separator"}),
+            (M_QUIT, {"label": "Убрать значок", "icon-name": "application-exit"}),
+        ]
+
+    def props_of(self, item_id, wanted=None):
+        for i, props in self.items():
+            if i != item_id:
+                continue
+            full = dict(props)
+            full.setdefault("enabled", True)
+            full.setdefault("visible", True)
+            if wanted:
+                full = {k: v for k, v in full.items() if k in wanted}
+            out = {}
+            for k, v in full.items():
+                if isinstance(v, bool):
+                    out[k] = GLib.Variant("b", v)
+                elif isinstance(v, int):
+                    out[k] = GLib.Variant("i", v)
+                else:
+                    out[k] = GLib.Variant("s", v)
+            return out
+        return {}
+
+    def menu_properties(self):
+        return {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }
+
+    def on_menu_call(self, conn, sender, path, iface, method, params,
+                     invocation, data=None):
+        if method == "GetLayout":
+            _parent, _depth, wanted = params.unpack()
+            children = [
+                GLib.Variant("(ia{sv}av)", (i, self.props_of(i, wanted), []))
+                for i, _ in self.items()
+            ]
+            layout = (0, {"children-display": GLib.Variant("s", "submenu")},
+                      children)
+            invocation.return_value(
+                GLib.Variant("(u(ia{sv}av))", (self.revision, layout)))
+
+        elif method == "GetGroupProperties":
+            ids, wanted = params.unpack()
+            ids = ids or [i for i, _ in self.items()]
+            invocation.return_value(GLib.Variant(
+                "(a(ia{sv}))", ([(i, self.props_of(i, wanted)) for i in ids],)))
+
+        elif method == "GetProperty":
+            item_id, name = params.unpack()
+            value = self.props_of(item_id).get(name, GLib.Variant("s", ""))
+            invocation.return_value(GLib.Variant("(v)", (value,)))
+
+        elif method == "Event":
+            item_id, event_id, _data, _ts = params.unpack()
+            if event_id == "clicked":
+                self.on_click(int(item_id))
+            invocation.return_value(None)
+
+        elif method == "EventGroup":
+            for item_id, event_id, _data, _ts in params.unpack()[0]:
+                if event_id == "clicked":
+                    self.on_click(int(item_id))
+            invocation.return_value(GLib.Variant("(ai)", ([],)))
+
+        elif method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+
+        elif method == "AboutToShowGroup":
+            invocation.return_value(GLib.Variant("(aiai)", ([], [])))
+
+        else:
+            invocation.return_value(None)
+
+    # ── действия ─────────────────────────────────────────────────
+    def toggle(self):
+        run_bg(DICTATION, "toggle")
+
+    def set_engine(self, value):
+        """Правим ENGINE в конфиге: строка есть — меняем, нет — дописываем."""
+        os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+        lines = read(CONFIG).splitlines()
+        out, done = [], False
+        for line in lines:
+            if line.strip().startswith("ENGINE=") and not done:
+                out.append(f'ENGINE="{value}"')
+                done = True
+            else:
+                out.append(line)
+        if not done:
+            out.append(f'ENGINE="{value}"')
+        with open(CONFIG, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        self.bump_menu()
+        self.emit(self.item_path, SNI_IFACE, "NewToolTip", None)
+
+    def on_click(self, item_id):
+        if item_id == M_TOGGLE:
+            self.toggle()
+        elif item_id == M_AUTO:
+            self.set_engine("auto")
+        elif item_id == M_CLOUD:
+            self.set_engine("cloud")
+        elif item_id == M_LOCAL:
+            self.set_engine("local")
+        elif item_id == M_CHECK:
+            run_bg("/bin/sh", "-c",
+                   f'out=$("{DICTATION}" cloud-test 2>&1); '
+                   f'kdialog --title "DeckVoice — облако" --msgbox "$out"')
+        elif item_id == M_CONFIG:
+            run_bg("xdg-open", CONFIG)
+        elif item_id == M_QUIT:
+            self.loop.quit()
+
+    def run(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig,
+                                 lambda: (self.loop.quit(), False)[1])
+        try:
+            self.loop.run()
+        finally:
+            self.release_pidfile()
+
+
+if __name__ == "__main__":
+    Tray().run()

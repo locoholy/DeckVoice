@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=DeckVoice — значок в лотке
+Name[ru]=DeckVoice — значок в лотке
+Comment=Показывает режим записи и позволяет переключить движок
+Exec=/home/deck/Documents/DeckVoice/bin/deck-voice-tray
+Icon=audio-input-microphone
+Terminal=false
+NoDisplay=true
+X-KDE-autostart-phase=2
+Categories=Utility;

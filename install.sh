@@ -27,6 +27,27 @@ if [ ! -f "$HOME/.config/deck-voice/config" ]; then
     echo "  конфиг:   ~/.config/deck-voice/config (из примера)"
 fi
 
+# Звуковая тема. Генерируется, а не лежит в репозитории: чужие звуки тянут
+# лицензии, а штатные звуки KDE длятся 1,3–2,1 с — для отклика это вечность.
+if command -v ffmpeg >/dev/null 2>&1; then
+    "$SRC/bin/deck-voice-sounds" >/dev/null 2>&1 \
+      && echo "  звуки:    собраны в $RUNTIME/sounds" \
+      || echo "  звуки:    собрать не вышло, останутся системные"
+else
+    echo "  звуки:    нет ffmpeg, останутся системные"
+fi
+
+# Значок в лотке. Ставим в автозапуск сеанса, а не в systemd: ему нужны
+# и D-Bus сеанса, и уже поднятая оболочка Plasma, а фаза 2 как раз про это.
+mkdir -p "$HOME/.config/autostart"
+sed "s|Exec=.*|Exec=$SRC/bin/deck-voice-tray|" "$SRC/desktop/deck-voice-tray.desktop" \
+  > "$HOME/.config/autostart/deck-voice-tray.desktop"
+echo "  значок:   автозапуск включён"
+if ! pgrep -f "bin/deck-voice-tray" >/dev/null 2>&1; then
+    setsid "$SRC/bin/deck-voice-tray" >/dev/null 2>&1 < /dev/null &
+    echo "            запущен сейчас"
+fi
+
 mkdir -p "$HOME/.config/systemd/user"
 cp -n "$SRC/systemd/ydotoold.service" "$HOME/.config/systemd/user/" 2>/dev/null || true
 systemctl --user daemon-reload
@@ -39,6 +60,21 @@ if [ -f "$RUNTIME/models/ggml-small.bin" ] && [ -d "$RUNTIME/pylib" ]; then
 else
     echo "ВНИМАНИЕ: нет рантайма в $RUNTIME"
     echo "  нужны: models/ggml-small.bin и pylib/ (python-библиотеки с pywhispercpp)"
+fi
+
+# Ключ облака держим отдельно от конфига и с правами 600: конфиг не жалко
+# показать или закоммитить, ключ — жалко.
+KEYF="$HOME/.config/deck-voice/cloud.key"
+if [ -f "$KEYF" ]; then
+    chmod 600 "$KEYF"
+    echo "  ключ:     $KEYF (права 600)"
+else
+    echo
+    echo "Облачный движок выключен — ключа нет, работает локальный whisper (~9 с)."
+    echo "  Чтобы включить быстрый режим (~1,5 с и точнее):"
+    echo "    1. взять бесплатный ключ на https://console.groq.com/keys"
+    echo "    2. echo 'gsk_...' > $KEYF && chmod 600 $KEYF"
+    echo "    3. $SRC/bin/deck-dictation cloud-test"
 fi
 
 echo

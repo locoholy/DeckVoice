@@ -8,6 +8,8 @@
 #   deck-dictation            переключить запись (для горячей клавиши)
 #   deck-dictation status     что установлено и работает ли
 #   deck-dictation logs       показать последний лог
+#   deck-dictation speed      сколько заняла каждая диктовка
+#   deck-dictation cloud-test проверить ключ и связь с облаком
 #   deck-dictation test       прогнать распознавание на тишине (проверка модели)
 #
 # Отладка:  DECKVOICE_DEBUG=1 deck-dictation
@@ -30,16 +32,59 @@ done
 # Всё переопределяется в ~/.config/deck-voice/config
 RUNTIME_DIR="$HOME/.local/share/deck-voice"
 MODEL="$RUNTIME_DIR/models/ggml-small.bin"
+
+# Движок распознавания:
+#   auto   — облако, если есть ключ и сеть; иначе локально (по умолчанию)
+#   cloud  — только облако, без отката
+#   local  — только локально, голос никуда не уходит
+ENGINE="auto"
+CLOUD_URL="https://api.groq.com/openai/v1/audio/transcriptions"
+CLOUD_MODEL="whisper-large-v3-turbo"
+CLOUD_KEY_FILE="$HOME/.config/deck-voice/cloud.key"
+CLOUD_CONNECT_TIMEOUT=4   # с, на установку соединения
+CLOUD_TIMEOUT=20          # с, на весь запрос
+# Затравка задаёт стиль вывода, и без неё пунктуация пропадает на речи без
+# пауз — на сплошном потоке модель отдаёт строчный текст без единого знака.
+# Замер на одной и той же записи:
+#   без затравки: «да бля чё то пока что пунктуации нет у меня до сих пор а чё»
+#   с затравкой:  «Да бля, чё-то пока что пунктуации нет у меня до сих пор. А чё,»
+# Это не указание модели, а образец: whisper продолжает в том же стиле.
+#
+# Обратная сторона — на тихой записи он возвращает саму затравку как якобы
+# распознанный текст. Поэтому затравка короткая, тишина отсекается до запроса,
+# а на выходе стоит проверка на эхо (см. looks_like_prompt).
+CLOUD_PROMPT="Так, поехали. Во-первых, да. Во-вторых, нет?"
 PYLIB="$RUNTIME_DIR/pylib"
 PYTHON="/usr/bin/python3"
 LANGUAGE="ru"
 THREADS=4
-MIC_BOOST="130%"          # 150% давало клиппинг
+# Не поднимать выше 130%. Проба со 180% закончилась клиппингом: два замера из
+# шести упёрлись в peak=1.0000, то есть звук срезало. Ошибка была в выборке —
+# опорные пики 0,127 и 0,241 сняли с тихих диктовок, а на обычной громкости
+# запас совсем не такой. Клиппинг портит распознавание сильнее, чем помогает
+# громкость.
+MIC_BOOST="130%"
 MIN_DURATION="0.5"        # короче — считаем промахом
 MIN_PEAK="0.008"          # тише — считаем тишиной
+# Размер буфера рекордера. По умолчанию parecord копит около секунды и по
+# сигналу об остановке этот буфер теряет — обрезалось последнее слово каждой
+# фразы, а фразы короче двух секунд пропадали целиком. С 30 мс теряется
+# меньше сотой доли секунды. Замеры: 2,00 с из 3,0 было, 3,06 с из 3,0 стало.
+REC_LATENCY_MS=30
 PASTE_KEY="ctrl-v"        # ctrl-v | ctrl-shift-v | none
 LOG_KEEP=5                # сколько логов хранить
-NOTIFY=1
+
+# Обратная связь. Три независимых слоя, см. раздел «обратная связь» ниже.
+NOTIFY=1                  # общий выключатель: 0 = ни звука, ни картинки
+FEEDBACK_SOUND=1          # короткие сигналы в динамик — самая быстрая реакция
+FEEDBACK_OSD=1            # оверлей Plasma (как при смене громкости), гаснет сам
+FEEDBACK_POPUP=1          # одно уведомление на время записи и распознавания
+SOUND_VOLUME=65           # громкость сигналов, % от общей громкости системы
+# Своя звуковая тема: короткие мягкие сигналы, см. bin/deck-voice-sounds.
+# Если каталога нет, подставляются штатные звуки KDE — они длинные и резкие,
+# но лучше, чем тишина.
+SOUND_DIR="$RUNTIME_DIR/sounds"
+WORK_TIMEOUT_MS=180000    # страховка: рабочий попап умрёт сам через 3 минуты
 
 CONFIG="${DECKVOICE_CONFIG:-$HOME/.config/deck-voice/config}"
 [[ -r "$CONFIG" ]] && . "$CONFIG"
@@ -69,12 +114,134 @@ rotate_log() {
 # засечь время: t_start NAME / t_end NAME
 declare -A _T
 t_start() { _T[$1]=$(date +%s%N); }
-t_end()   { local d=$(( ($(date +%s%N) - ${_T[$1]:-0}) / 1000000 )); log "$1: ${d} мс" TIME; }
+t_ms()    { echo $(( ($(date +%s%N) - ${_T[$1]:-0}) / 1000000 )); }
+t_end()   { log "$1: $(t_ms "$1") мс" TIME; }
 
-notify() {
-  [[ "$NOTIFY" == "1" ]] || return 0
-  notify-send -u critical -a "Голосовой ввод" -t "${3:-6000}" \
-    -i audio-input-microphone "$1" "$2" 2>>"$LOG" || true
+# printf "%-18s" в bash считает БАЙТЫ, а кириллица занимает по два —
+# колонки с русскими словами разъезжаются. Дополняем по символам сами.
+pad() {
+  local t="$1" n="$2" i
+  printf '%s' "$t"
+  for (( i = ${#t}; i < n; i++ )); do printf ' '; done
+}
+
+# 4 → «запуска». Русские числительные: 1 запуск, 2–4 запуска, 5+ запусков.
+plural() {
+  local n=$(( ${1#-} % 100 ))
+  (( n >= 11 && n <= 14 )) && { printf '%s' "$4"; return; }
+  case $(( n % 10 )) in
+    1) printf '%s' "$2" ;;
+    2|3|4) printf '%s' "$3" ;;
+    *) printf '%s' "$4" ;;
+  esac
+}
+
+# 8368 → «8,4 с». Десятичная запятая, как принято в русском.
+fmt_dur() {
+  local ms="${1:-0}"
+  printf '%d,%d с' $(( ms / 1000 )) $(( (ms % 1000) / 100 ))
+}
+
+# ─────────────────────── обратная связь ──────────────────────────
+# Почему раньше попапы копились и не гасли: `notify-send -u critical`.
+# По freedesktop-спеке уведомление с urgency=critical не истекает по
+# таймауту вообще — `-t` для него молча игнорируется, и Plasma держит его
+# до ручного закрытия. Три вызова за цикл (СЛУШАЮ / Обработка / Вставлено)
+# давали три вечных попапа, и так на каждую диктовку.
+#
+# Здесь три слоя, от самого быстрого к самому заметному:
+#
+#   ui_sound  звук. Уходит в динамик раньше, чем что-либо успеет
+#             нарисоваться — именно он подтверждает нажатие кнопки.
+#   ui_osd    оверлей Plasma, тот же, что показывает громкость. Гаснет сам
+#             за ~1,8 с и НЕ оседает в истории уведомлений. Для итогов.
+#   ui_popup  ровно один попап на весь цикл: переписывается по replace-id,
+#             живёт только пока идёт работа, закрывается программно.
+#
+# Итог: на экране максимум одна плашка, и она исчезает сама.
+
+NOTIFY_ID_FILE="$STATE_DIR/notify.id"
+# transcribe() бежит в подстановке команд, то есть в подоболочке, — обычная
+# переменная оттуда не вернётся. Поэтому движок отмечаем файлом.
+ENGINE_FILE="$STATE_DIR/engine.used"
+# Значок в лотке читает эти два файла и перерисовывается. Если значка нет,
+# запись в них просто никто не читает — на работу это не влияет.
+UI_STATE_FILE="$STATE_DIR/state"
+UI_LAST_FILE="$STATE_DIR/last"
+TRAY_PID_FILE="$STATE_DIR/tray.pid"
+
+# ui_sound ИМЯ — имя из своей темы (listen-start, listen-stop, done, oops).
+# Второй аргумент — запасной файл из системных звуков, если своей темы нет.
+ui_sound() {
+  [[ "$NOTIFY" == "1" && "$FEEDBACK_SOUND" == "1" ]] || return 0
+  local f="$SOUND_DIR/$1.ogg"
+  [[ -r "$f" ]] || f="/usr/share/sounds/${2:-Oxygen-Sys-App-Message.ogg}"
+  [[ -r "$f" ]] || { debug "нет звука: $1"; return 0; }
+  # setsid -f, иначе звук оборвётся на выходе из скрипта
+  setsid -f paplay --volume=$(( 65536 * SOUND_VOLUME / 100 )) "$f" >/dev/null 2>&1 || true
+}
+
+# ui_osd "текст" [имя-иконки]
+ui_osd() {
+  [[ "$NOTIFY" == "1" && "$FEEDBACK_OSD" == "1" ]] || return 0
+  local q
+  for q in qdbus6 qdbus; do
+    command -v "$q" >/dev/null 2>&1 || continue
+    "$q" org.kde.plasmashell /org/kde/osdService showText \
+      "${2:-audio-input-microphone}" "$1" 2>>"$LOG" && return 0
+  done
+  debug "OSD недоступен"
+  return 1
+}
+
+# ui_popup "заголовок" "текст" [таймаут_мс] [urgency]
+# Всегда переписывает свой прошлый попап, а не плодит новый.
+ui_popup() {
+  [[ "$NOTIFY" == "1" && "$FEEDBACK_POPUP" == "1" ]] || return 0
+  # Рабочие плашки («Слушаю», «Распознаю») отдаём значку, если он запущен.
+  [[ "${5:-}" == "worker" ]] && tray_running && return 0
+  local prev id
+  prev=$(cat "$NOTIFY_ID_FILE" 2>/dev/null || echo 0)
+  [[ "$prev" =~ ^[0-9]+$ ]] || prev=0
+  id=$(notify-send -p -r "$prev" -u "${4:-low}" -t "${3:-5000}" \
+         -a "Голосовой ввод" -i audio-input-microphone \
+         -h boolean:transient:true \
+         -h string:x-kde-origin-name:DeckVoice \
+         -h string:desktop-entry:deck-voice-toggle \
+         "$1" "$2" 2>>"$LOG") || return 1
+  [[ "$id" =~ ^[0-9]+$ ]] && printf '%s' "$id" >"$NOTIFY_ID_FILE"
+  return 0
+}
+
+# Убрать свой попап, не дожидаясь таймаута.
+ui_popup_close() {
+  local id; id=$(cat "$NOTIFY_ID_FILE" 2>/dev/null || true)
+  rm -f "$NOTIFY_ID_FILE"
+  [[ "$id" =~ ^[0-9]+$ && "$id" != "0" ]] || return 0
+  gdbus call --session --dest org.freedesktop.Notifications \
+    --object-path /org/freedesktop/Notifications \
+    --method org.freedesktop.Notifications.CloseNotification "$id" \
+    >/dev/null 2>>"$LOG" || true
+}
+
+# Конец цикла: попап убрать, итог показать оверлеем — он погаснет сам.
+# ui_result "текст" [иконка]
+ui_result() { ui_popup_close; ui_osd "$1" "${2:-audio-input-microphone}"; }
+
+# Обрезать текст под ширину оверлея.
+# idle | recording | working — три состояния, которые умеет показать значок.
+set_ui_state() { printf '%s' "$1" >"$UI_STATE_FILE" 2>/dev/null || true; }
+
+# Значок в лотке жив? Тогда он и есть индикатор режима, и попап не нужен:
+# две плашки об одном и том же — это шум.
+tray_running() {
+  local pid; pid=$(cat "$TRAY_PID_FILE" 2>/dev/null || true)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+snippet() {
+  local t="${1//$'\n'/ }" n="${2:-70}"
+  if (( ${#t} > n )); then printf '%s…' "${t:0:n}"; else printf '%s' "$t"; fi
 }
 
 # ─────────────────────────── буфер обмена ────────────────────────
@@ -96,10 +263,10 @@ copy_to_clipboard() {
 }
 
 send_paste() {
-  [[ "$PASTE_KEY" == "none" ]] && { notify "Готово" "Текст в буфере — вставь сам" 5000; return 0; }
+  [[ "$PASTE_KEY" == "none" ]] && { ui_popup "Текст в буфере" "Вставь сам: Ctrl+V" 5000 normal; return 0; }
   if [[ ! -x $HOME/.local/bin/ydotool || ! -S ${YDOTOOL_SOCKET} ]]; then
     err "ydotool недоступен (демон не запущен?)"
-    notify "Готово" "Текст в буфере — нажми Ctrl+V" 5000
+    ui_popup "Текст в буфере" "Автовставка не сработала — нажми Ctrl+V" 6000 normal
     return 1
   fi
   case "$PASTE_KEY" in
@@ -113,7 +280,9 @@ paste_text() {
   [[ -n "$text" ]] || return 0
   if ! copy_to_clipboard "$text"; then
     err "не удалось положить в буфер"
-    notify "⚠️ Буфер недоступен" "$text" 10000
+    # Текст надо успеть прочитать и скопировать глазами — этот попап живёт
+    # дольше остальных, но urgency normal, так что всё равно истечёт сам.
+    ui_popup "⚠️ Буфер недоступен" "$text" 15000 normal
     return 1
   fi
   sleep 0.15
@@ -130,7 +299,8 @@ is_recording() {
 stop_recorder() {
   local pid; pid=$(cat "$PIDFILE" 2>/dev/null || true)
   if [[ -n $pid ]]; then
-    # SIGINT, чтобы рекордер дописал заголовок WAV
+    # SIGINT даёт рекордеру дописать заголовок WAV. Но накопленный буфер он
+    # при этом теряет, поэтому буфер и держим маленьким — см. REC_LATENCY_MS.
     kill -INT "$pid" 2>/dev/null || true
     for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     kill -KILL "$pid" 2>/dev/null || true
@@ -142,7 +312,106 @@ stop_recorder() {
 }
 
 # ─────────────────────────── распознавание ───────────────────────
-transcribe() {
+# Два движка за одним интерфейсом. Облако быстрее и точнее, локальный
+# whisper работает без сети — поэтому по умолчанию облако с откатом.
+
+cloud_key() {
+  [[ -n "${DECKVOICE_CLOUD_KEY:-}" ]] && { printf '%s' "$DECKVOICE_CLOUD_KEY"; return 0; }
+  [[ -r "$CLOUD_KEY_FILE" ]] && { tr -d ' \t\r\n' <"$CLOUD_KEY_FILE"; return 0; }
+  return 1
+}
+
+cloud_ready() { [[ -n "$(cloud_key 2>/dev/null)" ]]; }
+
+# Облачное распознавание. Текст в stdout, пусто и ненулевой код — при любой
+# неудаче: нет ключа, нет сети, таймаут, ошибка API. Вызывающий откатится.
+transcribe_cloud() {
+  local key flac http body text
+  key=$(cloud_key) || { debug "облако: ключа нет"; return 1; }
+
+  # FLAC без потерь и вдвое легче WAV — на мобильном канале это заметно.
+  # Тем же проходом снимаем пиковую громкость: volumedetect пропускает звук
+  # насквозь, так что отсечка тишины достаётся бесплатно.
+  flac="$STATE_DIR/rec.flac"
+  rm -f "$flac"
+  local ff maxdb peak dur sz
+  ff=$(ffmpeg -nostdin -loglevel info -y -i "$WAV" -af volumedetect -c:a flac "$flac" 2>&1)
+  if [[ ! -s "$flac" ]]; then
+    err "облако: ffmpeg не смог сжать запись"
+    printf '%s' "$ff" | tail -3 >>"$LOG"
+    return 1
+  fi
+
+  # Молчание в облако не гоняем: это и трафик, и лишняя секунда, и повод
+  # для галлюцинации. Пустой ответ здесь — законный итог, а не сбой,
+  # поэтому код возврата нулевой и отката на локальный движок не будет.
+  sz=$(stat -c%s "$WAV" 2>/dev/null || echo 0)
+  dur=$(awk -v s="$sz" 'BEGIN{ printf "%.2f", (s > 44 ? (s - 44) / 32000 : 0) }')
+  maxdb=$(printf '%s' "$ff" | grep -oP 'max_volume:\s*\K-?[0-9.]+' | tail -1)
+  peak=$(awk -v d="${maxdb:--99}" 'BEGIN{ printf "%.4f", 10 ^ (d / 20) }')
+  log "облако: $sz Б wav → $(stat -c%s "$flac") Б flac, dur=$dur peak=$peak"
+  if awk -v d="$dur" -v p="$peak" -v md="$MIN_DURATION" -v mp="$MIN_PEAK" \
+       'BEGIN{ exit !(d < md || p < mp) }'; then
+    log "облако: тихо или коротко — запрос не отправляю"
+    rm -f "$flac"
+    printf ''
+    return 0
+  fi
+
+  t_start cloud
+  body=$(curl -sS --connect-timeout "$CLOUD_CONNECT_TIMEOUT" --max-time "$CLOUD_TIMEOUT" \
+    -w $'\n%{http_code}' \
+    -H "Authorization: Bearer $key" \
+    -F "file=@$flac;type=audio/flac" \
+    -F "model=$CLOUD_MODEL" \
+    -F "language=$LANGUAGE" \
+    -F "prompt=$CLOUD_PROMPT" \
+    -F "temperature=0" \
+    -F "response_format=text" \
+    "$CLOUD_URL" 2>>"$LOG")
+  local rc=$?
+  t_end cloud
+  rm -f "$flac"
+
+  if (( rc != 0 )); then
+    err "облако: curl не смог (код $rc) — откат на локальный whisper"
+    return 1
+  fi
+
+  http="${body##*$'\n'}"
+  text="${body%$'\n'*}"
+  if [[ "$http" != "200" ]]; then
+    # Ключ в лог не попадает: пишем только ответ сервера.
+    err "облако: HTTP $http — $(printf '%s' "$text" | head -c 200)"
+    return 1
+  fi
+
+  if looks_like_prompt "$text"; then
+    log "облако: вернуло эхо затравки — считаем, что речи не было" WARN
+    printf ''
+    return 0
+  fi
+
+  printf '%s' "$text"
+}
+
+# Похоже ли, что модель вернула нам нашу же затравку? Сравниваем без регистра
+# и знаков. Длинный текст эхом быть не может, поэтому проверяем только короткий.
+looks_like_prompt() {
+  local text="$1" a b
+  (( ${#text} > 80 )) && return 1
+  # tr регистр кириллицы не понижает — он работает побайтово, и «Во-первых»
+  # осталось бы с заглавной, разойдясь с затравкой. sed \L знает про UTF-8.
+  norm() { printf '%s' "$1" | sed 's/.*/\L&/' \
+             | sed 's/[^[:alnum:][:space:]]/ /g' | tr -s '[:space:]' ' ' \
+             | sed 's/^ //; s/ $//'; }
+  a=$(norm "$text"); b=$(norm "$CLOUD_PROMPT")
+  [[ -z "$a" ]] && return 0
+  [[ "$b" == *"$a"* ]]
+}
+
+# Локальный whisper через pywhispercpp. Работает без сети.
+transcribe_local() {
   PYTHONPATH="$PYLIB" "$PYTHON" - "$MODEL" "$WAV" "$LANGUAGE" "$THREADS" "$MIN_DURATION" "$MIN_PEAK" <<'PY'
 import sys, wave, re
 from pathlib import Path
@@ -183,7 +452,8 @@ for seg in m.transcribe(s, language=lang):
     t = (getattr(seg, "text", None) or str(seg) or "").strip()
     t = t.lstrip("-—– ").strip()
     t = re.sub(r"\[[^\]]*\]", "", t)
-    t = re.sub(r"\([^)]*\)", "", t).strip()
+    t = re.sub(r"\([^)]*\)", "", t)
+    t = re.sub(r"\*[^*]*\*", "", t).strip()   # *звук звука*, *музыка*
     if any(j in t.lower() for j in JUNK):
         continue
     if len(t) < 2 or t in (".", "..", "...", "…"):
@@ -198,12 +468,60 @@ print(text, end="")
 PY
 }
 
+# Причёсывание общее для обоих движков: облако тоже иногда возвращает
+# ведущие тире, лишние пробелы и переводы строк.
+clean_text() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e 's/^[—–-][[:space:]]*//' \
+      -e ':a;N;$!ba;s/\n/ /g' \
+      -e 's/[[:space:]]\{2,\}/ /g'
+}
+
+# Диспетчер: какой движок и что делать, если он не справился.
+transcribe() {
+  local text
+  case "$ENGINE" in
+    local)
+      printf 'local' >"$ENGINE_FILE"
+      transcribe_local | clean_text
+      ;;
+    cloud)
+      printf 'cloud' >"$ENGINE_FILE"
+      transcribe_cloud | clean_text
+      ;;
+    *)
+      if cloud_ready; then
+        if text=$(transcribe_cloud); then
+          printf 'cloud' >"$ENGINE_FILE"
+          printf '%s' "$text" | clean_text
+          return 0
+        fi
+        log "откат на локальный whisper" WARN
+        printf 'local-fallback' >"$ENGINE_FILE"
+      else
+        debug "ключа нет — сразу локально"
+        printf 'local' >"$ENGINE_FILE"
+      fi
+      transcribe_local | clean_text
+      ;;
+  esac
+}
+
 # ─────────────────────────── команды ─────────────────────────────
 cmd_status() {
   echo "DeckVoice"
   echo "  модель:      $MODEL $([ -f "$MODEL" ] && echo "($(du -h "$MODEL" | cut -f1))" || echo "— НЕТ")"
   echo "  библиотеки:  $PYLIB $([ -d "$PYLIB" ] && echo OK || echo "— НЕТ")"
   echo "  язык:        $LANGUAGE, потоков: $THREADS"
+  echo "  движок:      $ENGINE"
+  printf "  облако:      "
+  if cloud_ready; then
+    echo "$CLOUD_MODEL @ ${CLOUD_URL#https://}"
+    printf "  ключ:        "; echo "есть ($([[ -r "$CLOUD_KEY_FILE" ]] && echo "$CLOUD_KEY_FILE" || echo "\$DECKVOICE_CLOUD_KEY"))"
+  else
+    echo "ключа нет → работает только локальный whisper"
+    echo "               ключ кладётся в $CLOUD_KEY_FILE"
+  fi
   echo "  вставка:     $PASTE_KEY"
   printf "  ydotoold:    "; pgrep -x ydotoold >/dev/null && echo "работает" || echo "НЕ РАБОТАЕТ"
   printf "  сокет:       "; [ -S "$YDOTOOL_SOCKET" ] && echo "есть" || echo "НЕТ"
@@ -214,6 +532,86 @@ cmd_status() {
 }
 
 cmd_logs() { [[ -f "$LOG" ]] && cat "$LOG" || echo "лога нет"; }
+
+# Сколько занимала каждая диктовка — по всем сохранённым логам.
+cmd_speed() {
+  local n=0 sum=0 f w t
+  echo "Время от «стоп» до вставленного текста:"
+  echo
+  for f in $(ls -1t "$LOG_DIR"/*.log 2>/dev/null | tac); do
+    w=$(grep -oP 'whisper: \K[0-9]+' "$f" | tail -1)
+    t=$(grep -oP 'total: \K[0-9]+' "$f" | tail -1)
+    [[ -n "$t" ]] || continue
+    n=$((n + 1)); sum=$((sum + t))
+    local name; name=$(basename "$f" .log)
+    [[ "$name" == "current" ]] && name="последний"
+    local used mark
+    used=$(grep -oP 'движком \K[a-z-]+' "$f" | tail -1)
+    case "$used" in
+      cloud)          mark="☁ облако" ;;
+      local-fallback) mark="💻↩ откат" ;;
+      local)          mark="💻 локально" ;;
+      *)              mark="—" ;;
+    esac
+    printf '  %s %s всего %s %s\n' \
+      "$(pad "$name" 18)" "$(pad "$mark" 12)" "$(pad "$(fmt_dur "$t")" 8)" \
+      "$([[ -n "$w" ]] && echo "(распознавание $(fmt_dur "$w"))")"
+  done
+  echo
+  if (( n > 0 )); then
+    echo "  в среднем за $n $(plural "$n" запуск запуска запусков): $(fmt_dur $(( sum / n )))"
+  else
+    echo "  данных пока нет — продиктуй что-нибудь"
+  fi
+  echo
+  if cloud_ready; then
+    echo "  Облако включено: $CLOUD_MODEL"
+  else
+    echo "  Облако выключено — ключа нет. Локальный whisper упирается в ~9 с,"
+    echo "  из них ~0,9 с уходит на загрузку модели, остальное — сам разбор."
+    echo "  Как включить быстрый режим: deck-dictation cloud-test"
+  fi
+}
+
+# Проверить, что ключ рабочий и облако отвечает. Гоняет секунду тишины —
+# распознавать нечего, важен только код ответа.
+cmd_cloud_test() {
+  if ! cloud_ready; then
+    echo "Ключа нет. Положи его в $CLOUD_KEY_FILE:"
+    echo "  mkdir -p ~/.config/deck-voice"
+    echo "  echo 'gsk_...' > $CLOUD_KEY_FILE && chmod 600 $CLOUD_KEY_FILE"
+    echo
+    echo "Бесплатный ключ Groq: https://console.groq.com/keys"
+    return 1
+  fi
+  local tmp; tmp=$(mktemp -d)
+  ffmpeg -nostdin -loglevel error -y -f lavfi -i "anullsrc=r=16000:cl=mono" \
+    -t 1 -c:a flac "$tmp/probe.flac" 2>/dev/null
+  echo "Стучусь в ${CLOUD_URL#https://} моделью $CLOUD_MODEL…"
+  local t0 t1 out http
+  t0=$(date +%s%N)
+  out=$(curl -sS -w $'\n%{http_code}' --connect-timeout "$CLOUD_CONNECT_TIMEOUT" \
+      --max-time "$CLOUD_TIMEOUT" \
+      -H "Authorization: Bearer $(cloud_key)" \
+      -F "file=@$tmp/probe.flac;type=audio/flac" \
+      -F "model=$CLOUD_MODEL" -F "language=$LANGUAGE" -F "response_format=text" \
+      "$CLOUD_URL" 2>&1)
+  t1=$(date +%s%N)
+  rm -rf "$tmp"
+  http="${out##*$'\n'}"
+  if [[ "$http" == "200" ]]; then
+    echo "OK — ответ за $(( (t1 - t0) / 1000000 )) мс"
+  else
+    echo "НЕ ОК — HTTP $http"
+    printf '%s\n' "${out%$'\n'*}" | head -c 400; echo
+    case "$http" in
+      401) echo "→ ключ не принят: проверь, что скопирован целиком" ;;
+      429) echo "→ упёрся в лимит запросов, подожди немного" ;;
+      404) echo "→ модель $CLOUD_MODEL не найдена на этом endpoint" ;;
+    esac
+    return 1
+  fi
+}
 
 cmd_test() {
   echo "Проверяю загрузку модели (без звука)…"
@@ -232,26 +630,37 @@ print('модель загружена:', '$MODEL'.split('/')[-1])
 case "${1:-toggle}" in
   status) cmd_status; exit 0 ;;
   logs)   cmd_logs;   exit 0 ;;
+  speed)  cmd_speed;  exit 0 ;;
+  cloud-test) cmd_cloud_test; exit $? ;;
   test)   cmd_test;   exit 0 ;;
   toggle) ;;
-  *) echo "Использование: deck-dictation [toggle|status|logs|test]"; exit 1 ;;
+  *) echo "Использование: deck-dictation [toggle|status|logs|speed|test|cloud-test]"; exit 1 ;;
 esac
 
 # ---------- ОСТАНОВКА: распознать и вставить ----------
 if is_recording; then
   log "=== СТОП, обрабатываю ==="
   t_start total
+  # Реакция на кнопку идёт ДО тяжёлой работы: stop_recorder ждёт рекордер
+  # до секунды, и всё это время экран не должен молчать.
+  set_ui_state working
+  ui_sound listen-stop  "Oxygen-Sys-List-End.ogg"
+  ui_popup "Распознаю…" "Секунду" "$WORK_TIMEOUT_MS" low worker
+  # Если процесс прибьют посреди распознавания, попап не должен остаться.
+  trap 'ui_popup_close; set_ui_state idle; exit 130' INT TERM
   stop_recorder
-  notify "⏳ Обработка…" "Распознаю речь" 8000
 
   sz=$(stat -c%s "$WAV" 2>/dev/null || echo 0)
   log "размер записи: $sz байт"
   if [[ ! -f $WAV || $sz -lt 2000 ]]; then
     err "запись пустая или слишком короткая"
-    notify "⚠️ Пусто" "Слишком короткая запись — говори 2–5 секунд" 5000
+    ui_sound oops         "Oxygen-Sys-App-Negative.ogg"
+    ui_result "Слишком коротко — говори 2–5 секунд" "dialog-warning"
+    set_ui_state idle
     exit 0
   fi
 
+  rm -f "$ENGINE_FILE"
   t_start whisper
   TEXT="$(transcribe 2>>"$LOG" || true)"
   t_end whisper
@@ -259,17 +668,39 @@ if is_recording; then
 
   if [[ -z ${TEXT// /} ]]; then
     err "текст пустой"
-    notify "⚠️ Ничего не распознано" "Говори громче и ближе к микрофону" 7000
+    ui_sound oops         "Oxygen-Sys-App-Negative.ogg"
+    ui_result "Не расслышал — громче и ближе к микрофону" "dialog-warning"
+    set_ui_state idle
     exit 0
   fi
 
   t_start paste
   if paste_text "$TEXT"; then
     t_end paste
-    notify "✅ Вставлено" "$TEXT" 8000
-    log "успешно"
+    # Сам вставленный текст — уже лучшее подтверждение, поэтому попап
+    # закрываем, а на экране оставляем только гаснущий оверлей.
+    ui_sound done         "Oxygen-Sys-App-Positive.ogg"
+    # Время считаем от нажатия «стоп» до вставки — ровно то ожидание,
+    # которое человек и чувствует.
+    ELAPSED=$(t_ms total)
+    USED=$(cat "$ENGINE_FILE" 2>/dev/null || echo "?")
+    # Движок показываем иконкой из темы, а не словом и не эмодзи: у оверлея
+    # Plasma есть штатное место под значок, он рисуется в стиле системы и
+    # перекрашивается вместе с темой. Эмодзи тут выглядели чужеродно.
+    case "$USED" in
+      cloud)          MARK="облако"; MARK_ICON="cloudstatus" ;;
+      local-fallback) MARK="локально, облако молчало"; MARK_ICON="computer-fail" ;;
+      *)              MARK="локально"; MARK_ICON="cpu" ;;
+    esac
+    ui_result "$(snippet "$TEXT" 56) · $(fmt_dur "$ELAPSED")" "$MARK_ICON"
+    printf 'Последняя: %s, %s' "$MARK" "$(fmt_dur "$ELAPSED")" >"$UI_LAST_FILE" 2>/dev/null || true
+    set_ui_state idle
+    log "успешно за $(fmt_dur "$ELAPSED") движком $USED ($(snippet "$TEXT" 40))" SPEED
   else
     t_end paste
+    # paste_text уже поставил свой попап с причиной — не перебиваем его.
+    ui_sound oops         "Oxygen-Sys-Warning.ogg"
+    set_ui_state idle
     log "вставка не удалась, текст в буфере" WARN
   fi
   t_end total
@@ -281,30 +712,44 @@ rotate_log
 log "=== СТАРТ ==="
 debug "модель=$MODEL язык=$LANGUAGE потоков=$THREADS вставка=$PASTE_KEY"
 
+# Если прошлый запуск упал, не закрыв свой попап, — добиваем его здесь.
+ui_popup_close
+
 if [[ ! -f $MODEL ]]; then
   err "модель не найдена: $MODEL"
-  notify "Ошибка" "Нет модели. Проверь: deck-dictation status" 6000
+  ui_sound oops         "Oxygen-Sys-Warning.ogg"
+  ui_popup "Нет модели" "Проверь: deck-dictation status" 8000 normal
+  set_ui_state idle
   exit 1
 fi
 if [[ ! -d $PYLIB ]]; then
   err "нет каталога библиотек: $PYLIB"
-  notify "Ошибка" "Нет python-библиотек. Проверь: deck-dictation status" 6000
+  ui_sound oops         "Oxygen-Sys-Warning.ogg"
+  ui_popup "Нет python-библиотек" "Проверь: deck-dictation status" 8000 normal
   exit 1
 fi
 
 stop_recorder 2>/dev/null || true
 rm -f "$WAV"
 
+# Звук — первым делом: кнопка нажата, и это слышно раньше, чем pactl и
+# рекордер отработают свои ~100 мс.
+ui_sound listen-start "Oxygen-Sys-App-Message.ogg"
+
 pactl set-source-mute @DEFAULT_SOURCE@ 0 2>/dev/null || true
 pactl set-source-volume @DEFAULT_SOURCE@ "$MIC_BOOST" 2>/dev/null || true
 debug "микрофон: $(pactl get-default-source 2>/dev/null), усиление $MIC_BOOST"
 
 if command -v parecord >/dev/null; then
-  parecord --channels=1 --rate=16000 --file-format=wav "$WAV" >>"$LOG" 2>&1 &
+  parecord --latency-msec="$REC_LATENCY_MS" --channels=1 --rate=16000 \
+    --file-format=wav "$WAV" >>"$LOG" 2>&1 &
 else
   pw-record --channels=1 --rate=16000 "$WAV" >>"$LOG" 2>&1 &
 fi
 echo $! >"$PIDFILE"
 log "запись пошла, pid=$(cat "$PIDFILE")"
-notify "🔴 СЛУШАЮ" "Говори… Ещё раз кнопку = стоп" 60000
+set_ui_state recording
+# Запись — это режим, а не событие. Если значок в лотке запущен, режим видно
+# по нему, и попап не появляется вовсе; иначе плашка держится до остановки.
+ui_popup "Слушаю" "Ещё раз кнопку — стоп" "$WORK_TIMEOUT_MS" low worker
 exit 0
