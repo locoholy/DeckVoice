@@ -2,3 +2,4 @@ pylib/
 models/
 *.log
 __pycache__/
+.claude/

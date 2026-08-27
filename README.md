@@ -1,336 +1,341 @@
 # DeckVoice
 
-Голосовой ввод для Steam Deck. Одна кнопка: нажал — говоришь, нажал ещё раз —
-текст оказывается в активном поле. Работает в Plasma Wayland.
+Voice typing for the Steam Deck. One button: press, talk, press again — the text
+lands in whatever field has focus. Built for **KDE Plasma on Wayland**, where the
+usual dictation tools do not work.
+
+**English** · [Русский](README.ru.md)
+
+![SteamOS](https://img.shields.io/badge/SteamOS-holo-1a9fff?style=flat-square)
+![Wayland](https://img.shields.io/badge/Plasma-Wayland-5ba32b?style=flat-square)
+![Whisper](https://img.shields.io/badge/whisper-cloud_+_local-e5a50a?style=flat-square)
+![No root](https://img.shields.io/badge/root-not_required-7a8894?style=flat-square)
 
 ---
 
-## Это не форк Vocalinux
+## This is not a Vocalinux fork
 
-Важно понимать, откуда всё выросло. Изначально ставился
-[Vocalinux](https://github.com/jatinkrmalik/vocalinux), но **его код здесь не
-используется ни строчки**. От него нужны были только две вещи — Python-библиотеки
-с `pywhispercpp` и скачанные модели Whisper. Сама программа своя.
+Worth being clear about where it came from. [Vocalinux](https://github.com/jatinkrmalik/vocalinux)
+was installed first, but **not a line of its code is used here**. Two things were
+kept from it: the Python libraries with `pywhispercpp`, and the downloaded
+Whisper models. The program itself is original.
 
-Поэтому и рантайм переехал в собственный каталог: `~/.local/share/deck-voice/`.
-Демон Vocalinux (223 МБ в памяти) был убран из автозапуска — он ничего не делал.
+That is also why the runtime moved to its own directory,
+`~/.local/share/deck-voice/`. The Vocalinux daemon — 223 MB resident — was
+dropped from autostart, since it did nothing.
 
 ---
 
-## Как устроено
+## How it works
 
 ```
-кнопка (F12 / R1)
+button (F12 / R1)
    ↓
 deck-dictation toggle
    ↓
-1-е нажатие: parecord → rec.wav (16 кГц, моно)
-2-е нажатие: SIGINT рекордеру (чтобы дописался заголовок WAV)
+1st press: parecord → rec.wav (16 kHz, mono)
+2nd press: SIGINT to the recorder (so the WAV header gets written)
    ↓
-есть ключ и сеть? ──да──→ ffmpeg → flac → Groq whisper-large-v3-turbo
-   │                              ↑                    │
-   нет / не ответило ─────────────┘                    │
+key and network? ──yes──→ ffmpeg → flac → Groq whisper-large-v3-turbo
+   │                             ↑                     │
+   no / no answer ───────────────┘                     │
    ↓                                                   │
-python3 + pywhispercpp → whisper small, язык ru ───────→┤
+python3 + pywhispercpp → whisper small, ru ───────────→┤
    ↓                                                   ↓
-Klipper (D-Bus) кладёт текст в буфер
+Klipper (D-Bus) puts the text on the clipboard
    ↓
-ydotool жмёт Ctrl+V в активное окно
+ydotool presses Ctrl+V into the focused window
 ```
 
-**Почему Klipper, а не `wl-copy`.** В SteamOS нет пакета `wl-clipboard`, а корень
-только для чтения. Klipper — штатный буфер обмена Plasma, он уже работает в
-сессии и умеет то же самое:
+**Why Klipper and not `wl-copy`.** SteamOS has no `wl-clipboard` package and a
+read-only root. Klipper is Plasma's own clipboard, already running in the
+session, and does the same job:
 
 ```bash
-qdbus6 org.kde.klipper /klipper setClipboardContents "текст"
+qdbus6 org.kde.klipper /klipper setClipboardContents "text"
 ```
 
-Это была причина, по которой раньше «распознавало, но не вставляло»: `wl-copy`
-не существовал, текст не доходил до буфера, а Ctrl+V вставлял то, что лежало там
-с прошлого раза.
+This was the reason for the old “it transcribes but never pastes” bug: `wl-copy`
+did not exist, the text never reached the clipboard, and Ctrl+V pasted whatever
+had been there before.
 
-**Почему модель `small`, а не `tiny`.** На русском `tiny` галлюцинирует: выдаёт
-«редактор субтитров», «продолжение следует», «аплодисменты» — следы обучения на
-ютубовских субтитрах. `small` (466 МБ) на порядок точнее. Фильтр этих фраз в коде
-оставлен на всякий случай.
+**Why the `small` model and not `tiny`.** On Russian, `tiny` hallucinates —
+“subtitle editor”, “to be continued”, “applause”: leftovers from training on
+YouTube subtitles. `small` (466 MB) is far more accurate. A filter for those
+phrases is still in the code, just in case.
 
 ---
 
-## Установка
+## Install
 
 ```bash
-./install.sh      # sudo не нужен
-./selftest.sh     # проверка всего
+./install.sh      # no sudo
+./selftest.sh     # checks everything
 ```
 
-Горячая клавиша назначается в *Параметры системы → Горячие клавиши* на «🎤 Голос».
+Bind the hotkey in *System Settings → Shortcuts* to “🎤 Голос”.
 
-Рантайм (модели и библиотеки, ~760 МБ) в репозиторий не входит и лежит в
-`~/.local/share/deck-voice/`.
+The runtime (models and libraries, ~760 MB) is not in the repository; it lives
+in `~/.local/share/deck-voice/`.
 
 ---
 
-## Настройка
+## Configuration
 
-Файл `~/.config/deck-voice/config`, подключается как bash. Всё, что стоит трогать:
+`~/.config/deck-voice/config`, sourced as bash. What is worth touching:
 
-| Параметр | Смысл |
+| Setting | Meaning |
 |---|---|
-| `MODEL` | путь к модели; `tiny` быстрее, но врёт на русском |
-| `LANGUAGE` | язык распознавания |
-| `THREADS` | потоков whisper; у Deck 4 ядра, больше не ускоряет |
-| `MIC_BOOST` | усиление микрофона, по умолчанию 130%; выше — клиппинг |
-| `REC_LATENCY_MS` | буфер рекордера; больше — теряется хвост фразы |
-| `PASTE_KEY` | `ctrl-v`, `ctrl-shift-v` или `none` |
-| `MIN_PEAK`, `MIN_DURATION` | пороги отсечки тишины и слишком коротких нажатий |
-| `FEEDBACK_SOUND`, `FEEDBACK_OSD`, `FEEDBACK_POPUP` | три слоя обратной связи, см. ниже |
-| `SOUND_VOLUME` | громкость сигналов, % |
+| `MODEL` | path to the model; `tiny` is faster but unreliable |
+| `LANGUAGE` | recognition language |
+| `THREADS` | whisper threads; the Deck has 4 cores, more does not help |
+| `MIC_BOOST` | microphone gain, 130% by default; higher clips |
+| `REC_LATENCY_MS` | recorder buffer; larger loses the tail of the phrase |
+| `PASTE_KEY` | `ctrl-v`, `ctrl-shift-v` or `none` |
+| `MIN_PEAK`, `MIN_DURATION` | silence and too-short-press cutoffs |
+| `FEEDBACK_SOUND`, `FEEDBACK_OSD`, `FEEDBACK_POPUP` | three feedback layers, see below |
+| `SOUND_VOLUME` | signal volume, % |
 
-Пример со всеми ключами — `config/deck-voice.conf.example`.
+Every key with comments is in `config/deck-voice.conf.example`.
 
 ---
 
-## Движок распознавания
+## Recognition engine
 
-Локальный whisper на процессоре Дека упирается в ~9 секунд, и это не лечится
-мелочами: замеры показали, что загрузка модели занимает ~0,9 с, а остальные
-восемь — сам разбор. Уменьшать модель бессмысленно, `tiny` считает за 1,4 с,
-но путает слова. Поэтому основной путь теперь облачный, а локальный остался
-запасным.
-
-```
-ENGINE=auto     облако, если есть ключ и сеть; иначе локальный whisper
-ENGINE=cloud    только облако
-ENGINE=local    только локально, голос не покидает устройство
-```
-
-**Почему Groq.** `whisper-large-v3-turbo` — модель крупнее локальной `small`,
-то есть точность выше, а не ниже, при этом считается на их железе за доли
-секунды. Endpoint совместим с OpenAI, так что в `CLOUD_URL` и `CLOUD_MODEL`
-подставляются OpenAI, Mistral Voxtral или собственный `whisper-server` — код
-один и тот же.
-
-**Пунктуация держится на затравке.** Без параметра `prompt` модель на речи без
-пауз отдаёт сплошной строчный текст. На одной и той же записи:
+Local whisper on the Deck's CPU bottoms out at ~9 seconds, and no small change
+fixes that: measured, loading the model takes ~0.9 s and the remaining eight are
+the transcription itself. Shrinking the model is not the answer — `tiny` finishes
+in 1.4 s but confuses words. So the cloud is now the main path and local is the
+fallback.
 
 ```
-без затравки: да бля чё то пока что пунктуации нет у меня до сих пор а чё
-с затравкой:  Да бля, чё-то пока что пунктуации нет у меня до сих пор. А чё,
+ENGINE=auto     cloud when there is a key and a network; local otherwise
+ENGINE=cloud    cloud only
+ENGINE=local    local only, the recording never leaves the device
 ```
 
-Затравка — не указание, а образец: whisper продолжает в заданном стиле.
-Обратная сторона в том, что на тихой записи он возвращает саму затравку как
-якобы распознанный текст (однажды так вылезло «Пиши с пунктом.»). Поэтому
-тишина отсекается до запроса, а на выходе стоит проверка на эхо. Регистр в ней
-понижается через `sed \L`, а не `tr`: `tr` работает побайтово и кириллицу не
-трогает, из-за чего сравнение молча промахивалось.
+**Why Groq.** `whisper-large-v3-turbo` is a *larger* model than the local
+`small`, so accuracy goes up rather than down, and it runs on their hardware in
+a fraction of a second. The endpoint is OpenAI-compatible, so `CLOUD_URL` and
+`CLOUD_MODEL` also accept OpenAI, Mistral Voxtral or a local `whisper-server` —
+the code stays the same.
 
-**Что уходит в сеть.** Сама запись голоса, сжатая в FLAC (без потерь, примерно
-вдвое легче WAV). Тишина и слишком короткие нажатия отсекаются **до** запроса:
-пик громкости снимается тем же вызовом `ffmpeg`, что и сжатие, так что проверка
-достаётся бесплатно. Если голос никуда отправлять не хочется — `ENGINE="local"`,
-и всё работает как раньше.
+**Punctuation rests on the prompt.** Without a `prompt` parameter, speech
+without pauses comes back as one lowercase run-on. Same recording, both ways:
 
-**Откат.** Любая неудача облака — нет ключа, нет сети, таймаут, 401, 429 —
-роняет запрос в лог и молча передаёт работу локальному whisper. Без текста
-не останешься никогда, просто иногда ждёшь девять секунд вместо полутора.
-В оверлее видно, кто отработал: `☁` облако, `💻` локально, `💻↩` — облако
-не ответило и выручил локальный.
+```
+no prompt:   да бля чё то пока что пунктуации нет у меня до сих пор а чё
+with prompt: Да бля, чё-то пока что пунктуации нет у меня до сих пор. А чё,
+```
 
-**Ключ.** Лежит отдельным файлом, не в конфиге, чтобы не утёк вместе с ним:
+The prompt is a sample, not an instruction: whisper simply continues in the
+style it was given. The flip side is that on a near-silent recording it returns
+the prompt itself as if it had been transcribed. So silence is cut *before* the
+request, and the response is checked for that echo. The comparison lowercases
+with `sed \L`, not `tr` — `tr` works byte-wise, leaves Cyrillic untouched, and
+the check silently missed.
+
+**What leaves the device.** The recording itself, compressed to FLAC — lossless
+and about half the size of WAV. Silence and accidental taps are discarded
+*before* the request: the peak level comes from the same `ffmpeg` call that does
+the compression, so the check is free. If you would rather nothing left the
+device at all, set `ENGINE="local"` and it works as it always did.
+
+**Fallback.** Any cloud failure — no key, no network, timeout, 401, 429 — is
+logged and quietly handed to local whisper. You never end up without text; you
+occasionally wait nine seconds instead of one and a half. The overlay says which
+engine answered: `☁` cloud, `💻` local, `💻↩` cloud timed out and local covered.
+
+**The key** lives in its own file rather than in the config, so it cannot leak
+along with it:
 
 ```bash
 mkdir -p ~/.config/deck-voice
 echo 'gsk_...' > ~/.config/deck-voice/cloud.key
 chmod 600 ~/.config/deck-voice/cloud.key
-deck-dictation cloud-test     # проверить, что принимается
+deck-dictation cloud-test     # check that it is accepted
 ```
 
-Бесплатный ключ — https://console.groq.com/keys
-
-**Звуки самой системы** к DeckVoice отношения не имеют, но раздражают тем же:
-штатный Oxygen играет уведомление 13,4 с, Ocean — 2,1 с. Переключаются в
-*Параметры системы → Выбор набора звуков уведомлений* (`kcmshell6
-kcm_soundtheme`), а послушать все подряд одинаковой громкостью удобнее через
-`bin/deck-voice-soundroom`. Свои темы на SteamOS кладутся в
-`~/.local/share/sounds/` — корень только для чтения, но домашний каталог
-система просматривает, и root не нужен.
+A free key: <https://console.groq.com/keys>
 
 ---
 
-## Значок в лотке
+## Tray icon
 
-Уведомление — плохой индикатор режима: оно кричит, лезет поверх окна и всё
-равно исчезает. «Идёт запись» — это режим, и его место там же, где громкость
-и вайфай. Поэтому состояние показывает значок в системном лотке:
+A notification is a poor mode indicator: it shouts, covers the window, and
+disappears anyway. “Recording” is a *mode*, and modes belong where volume and
+Wi-Fi live. So the state is shown by a tray icon:
 
-| Значок | Состояние |
+| Icon | State |
 |---|---|
-| микрофон | готов |
-| красная точка | идёт запись |
-| стрелки обновления | распознаю |
+| microphone | idle |
+| red dot | recording |
+| refresh arrows | transcribing |
 
-Левый клик — то же, что горячая клавиша: старт и стоп. Правый — меню: движок
-(авто / только облако / только локально), проверка облака, настройки. В
-подсказке видно текущий движок и чем прошла последняя диктовка.
+Left click does what the hotkey does — start and stop. Right click opens a menu:
+engine (auto / cloud only / local only), a cloud check, settings. The tooltip
+shows the current engine and which one handled the last dictation.
 
-Пока значок запущен, всплывающих плашек про запись **не появляется вовсе** —
-две штуки об одном и том же были бы шумом. Если значок закрыть, плашки
-возвращаются: без индикатора о режиме записи не сообщит уже никто.
+While the icon is running, recording popups **do not appear at all** — two
+indicators for one thing would be noise. Close the icon and the popups come
+back: without an indicator, nothing else would report the mode.
 
-**Как это сделано.** В SteamOS нет ни PyQt, ни AppIndicator, поэтому значок
-регистрируется напрямую по D-Bus как `StatusNotifierItem`, а меню отдаётся
-через `com.canonical.dbusmenu` — оба интерфейса Plasma обслуживает штатно.
-Из зависимостей только `python-gobject`, он в системе есть.
+**How it is done.** SteamOS has neither PyQt nor AppIndicator, so the icon
+registers itself directly over D-Bus as a `StatusNotifierItem`, and the menu is
+served through `com.canonical.dbusmenu` — Plasma supports both natively. The
+only dependency is `python-gobject`, which is already present.
 
-Две грабли, на которые стоит не наступать повторно:
+Two traps worth not stepping into twice:
 
-- **`dbus-python` для меню не годится.** `GetLayout` обязан вернуть массив
-  вариантов со структурами внутри (`av`), а dbus-python такое не маршалит
-  вообще — он угадывает типы и падает с «Expected a string». Поэтому здесь
-  Gio: у `GVariant` сигнатуры задаются явно.
-- **Свойства через колбэки `register_object` в PyGObject молча не работают** —
-  методы вызываются, а любой запрос свойства падает с «Unable to retrieve
-  property». Поэтому `org.freedesktop.DBus.Properties` реализован здесь
-  вручную, обычными методами.
+- **`dbus-python` cannot serve the menu.** `GetLayout` must return an array of
+  variants containing structures (`av`), which dbus-python does not marshal at
+  all — it guesses types and fails with “Expected a string”. Hence Gio: with
+  `GVariant`, signatures are stated explicitly.
+- **Properties via `register_object` callbacks silently do not work in
+  PyGObject** — methods get called, but any property request fails with “Unable
+  to retrieve property”. So `org.freedesktop.DBus.Properties` is implemented
+  here by hand, as ordinary methods.
 
-Демон ничего не распознаёт сам: он читает файлы состояния и дёргает
-`deck-dictation toggle`. Если он упадёт, голосовой ввод продолжит работать с
-горячей клавиши — значок это удобство, а не критическая деталь.
+The daemon transcribes nothing itself: it reads state files and calls
+`deck-dictation toggle`. If it dies, voice typing keeps working from the hotkey
+— the icon is a convenience, not a critical part.
 
 ---
 
-## Обратная связь
+## Feedback
 
-Раньше на каждую диктовку оставалось три уведомления, и они не гасли. Причина
-не в таймауте, а в одном флаге: `notify-send -u critical`. По freedesktop-спеке
-уведомление с `urgency=critical` **не истекает по таймауту вообще** — `-t` для
-него молча игнорируется, и Plasma держит попап до ручного закрытия. Три вызова
-за цикл (СЛУШАЮ → Обработка → Вставлено) давали три вечных плашки, и так на
-каждое нажатие.
+Dictation used to leave three notifications behind, and they never went away.
+The cause was not a timeout but a single flag: `notify-send -u critical`. By the
+freedesktop spec, a notification with `urgency=critical` **never expires** —
+`-t` is silently ignored and Plasma holds the popup until it is dismissed by
+hand. Three calls per cycle (LISTENING → Processing → Pasted) meant three
+permanent popups, on every single press.
 
-Теперь три независимых слоя, от самого быстрого к самому заметному:
+There are now three independent layers, fastest to most visible:
 
-| Слой | Что это | Когда |
+| Layer | What it is | When |
 |---|---|---|
-| значок в лотке | режим: готов / запись / распознавание | пока он запущен, плашки о записи не показываются |
-| звук | короткий сигнал в динамик | подтверждает **само нажатие** — уходит раньше, чем что-либо нарисуется |
-| оверлей | тот же, что показывает громкость (`org.kde.osdService`) | итог: распознанный текст и время. Гаснет сам за ~1,8 с |
-| попап | обычное уведомление, **ровно одно на цикл** | только пока идёт работа: «Слушаю» → «Распознаю» |
+| tray icon | mode: idle / recording / transcribing | while it runs, recording popups are suppressed |
+| sound | a short signal | confirms **the press itself** — it fires before anything can be drawn |
+| overlay | the same OSD that shows volume (`org.kde.osdService`) | the result: text and elapsed time. Fades on its own in ~1.8 s |
+| popup | an ordinary notification, **exactly one per cycle** | only while work is happening: “Listening” → “Transcribing” |
 
-Что изменилось по существу:
+What actually changed:
 
-- **`urgency` теперь `low`/`normal`** — попапы снова подчиняются таймауту.
-- **Попап переписывается, а не плодится.** `notify-send -p` возвращает id,
-  он ложится в `$XDG_RUNTIME_DIR/deck-voice/notify.id`, следующий вызов идёт
-  с `-r <id>`. На экране всегда одна плашка, она меняет текст на месте.
-- **Попап закрывается программно** через `CloseNotification`, а не ждёт
-  таймаута. Текст появился в поле — плашка исчезла в тот же момент.
-- **Хинт `transient:true`** — уведомления не оседают в истории. Центр
-  уведомлений больше не забивается.
-- **Итог показывается оверлеем, а не попапом.** Вставленный текст и так виден
-  в поле, второй раз держать его на экране незачем.
-- **Свои звуки вместо системных.** Штатные звуки KDE не годятся по существу:
-  `Oxygen-Sys-App-Message` длится 1,3 с, `List-End` и `Positive` — по 2,1 с.
-  Звук ещё тянется, когда всё давно случилось. Свои — 92–168 мс на слух:
-  почти чистые синусы, мягкая атака, экспоненциальное затухание. Квинта вверх
-  «начал слушать», та же квинта вниз «закончил» — направление считывается без
-  слов. Собираются скриптом `bin/deck-voice-sounds`, в репозитории лежит
-  рецепт, а не звуковые файлы: так нет ни лицензионных вопросов, ни блобов
-  в истории, а тон и длительность правятся числом в одной строке.
-- **Никаких эмодзи.** В системном оверлее они выглядят чужеродно и в разных
-  темах рисуются по-разному. Движок показывается штатным значком темы:
-  облачко для облака, процессор для локального разбора.
-- **Страховка от зависших плашек.** Рабочий попап получает `WORK_TIMEOUT_MS`
-  (3 минуты), а следующий запуск первым делом добивает попап предыдущего —
-  если скрипт прибили посреди распознавания, на экране ничего не останется.
+- **`urgency` is now `low`/`normal`** — popups obey their timeout again.
+- **The popup is rewritten, not multiplied.** `notify-send -p` returns an id,
+  it goes into `$XDG_RUNTIME_DIR/deck-voice/notify.id`, and the next call passes
+  `-r <id>`. There is always one popup on screen, changing its text in place.
+- **The popup is closed programmatically** through `CloseNotification` instead
+  of waiting out a timeout. The text appears in the field, the popup goes away
+  at that same moment.
+- **`transient:true` hint** — notifications no longer pile up in the history.
+- **The result is shown by the overlay, not a popup.** The pasted text is
+  already visible in the field; keeping it on screen twice is pointless.
+- **Own sounds instead of the system set.** The stock KDE sounds do not fit on
+  the merits: `Oxygen-Sys-App-Message` runs 1.3 s, `List-End` and `Positive`
+  2.1 s each. The sound is still going when everything has long since happened.
+  Ours are 92–168 ms: near-pure sines, soft attack, exponential decay. A fifth
+  up for “started listening”, the same fifth down for “done” — the direction
+  reads without words. They are generated by `bin/deck-voice-sounds`; the
+  repository holds the recipe, not the audio, so there are no licensing
+  questions, no blobs in history, and pitch or length is one number away.
+- **No emoji.** In the system overlay they look foreign and render differently
+  across themes. The engine is shown with a stock theme icon instead: a cloud
+  for cloud, a chip for local.
+- **Insurance against stuck popups.** The working popup gets `WORK_TIMEOUT_MS`
+  (3 minutes), and the next run's first act is to kill the previous run's popup
+  — so if the script is killed mid-transcription, nothing is left behind.
 
-Слои переключаются независимо. Полностью беззвучный режим — `FEEDBACK_SOUND=0`;
-режим без всплывашек — `FEEDBACK_POPUP=0`, останутся звук и гаснущий оверлей;
-`NOTIFY=0` выключает всё.
+The layers switch independently. Fully silent: `FEEDBACK_SOUND=0`. No popups,
+keeping the sound and the fading overlay: `FEEDBACK_POPUP=0`. `NOTIFY=0` turns
+off everything.
 
 ---
 
-## Отладка
+## Debugging
 
 ```bash
-deck-dictation status         # что установлено, что работает
-deck-dictation logs           # лог последнего запуска
-deck-dictation speed          # сколько заняла каждая диктовка
-deck-dictation cloud-test     # проверить ключ и связь с облаком
-./bin/deck-voice-soundroom     # послушать звуковые темы системы и выбрать
-deck-dictation test           # проверить, что модель грузится
-./selftest.sh                 # полная проверка окружения
+deck-dictation status         # what is installed, what runs
+deck-dictation logs           # log of the last run
+deck-dictation speed          # how long each dictation took
+deck-dictation cloud-test     # check the key and the cloud connection
+./bin/deck-voice-soundroom    # audition the system sound themes and pick one
+deck-dictation test           # check that the model loads
+./selftest.sh                 # full environment check
 ```
 
-Подробный лог:
+Verbose log:
 
 ```bash
 DECKVOICE_DEBUG=1 deck-dictation
 ```
 
-Логи в `~/.local/state/deck-voice/`, при каждом старте записи заводится новый,
-хранятся последние 5. В логе есть тайминги каждой фазы:
+Logs go to `~/.local/state/deck-voice/`, a new one per recording, last 5 kept.
+Each phase is timed:
 
 ```
-11:42:03.418 [TIME] whisper: 4212 мс
-11:42:03.605 [TIME] paste: 187 мс
-11:42:03.607 [TIME] total: 4735 мс
+11:42:03.418 [TIME] whisper: 4212 ms
+11:42:03.605 [TIME] paste: 187 ms
+11:42:03.607 [TIME] total: 4735 ms
 ```
 
-Время каждой диктовки видно и без логов: оверлей после вставки показывает его
-рядом с текстом («…распознанный текст · 8,4 с»), а `deck-dictation speed`
-сводит историю по всем сохранённым логам.
+The time is also visible without logs: the overlay shows it next to the text
+(“…transcribed text · 8.4 s”), and `deck-dictation speed` summarises the history
+across all kept logs.
 
 ---
 
-## Известные шероховатости
+## Known rough edges
 
-- **Обрезался конец каждой фразы — исправлено.** `parecord` по умолчанию копит
-  около секунды звука и по сигналу об остановке этот буфер теряет: дописывался
-  только заголовок WAV. Замеры: из трёх секунд речи в файл попадали две, а
-  фразы короче двух секунд пропадали целиком (файл в 44 байта — один заголовок).
-  Лечится флагом `--latency-msec=30`: потери упали до 0,09 с и перестали
-  зависеть от длины фразы. Симптом выглядел как «микрофон не слышит тихую
-  речь», хотя громкость была ни при чём.
+- **The end of every phrase was cut off — fixed.** By default `parecord` buffers
+  about a second of audio and loses it when told to stop: only the WAV header
+  was written. Measured: two seconds out of three made it into the file, and
+  phrases shorter than two seconds vanished completely (a 44-byte file — the
+  header alone). The fix is `--latency-msec=30`: loss dropped to 0.09 s and
+  stopped depending on phrase length. The symptom looked like “the microphone
+  cannot hear quiet speech”, though gain had nothing to do with it.
+- **It will not paste into a terminal.** Konsole does not take Ctrl+V, it wants
+  Ctrl+Shift+V. `PASTE_KEY="ctrl-shift-v"` works around it but then breaks
+  pasting into ordinary fields. The proper fix is detecting the focused window
+  class.
+- **Microphone gain above 130% breaks recognition.** A test at 180% clipped
+  (`peak=1.0000`) on two recordings out of six and the text drifted: on one
+  phrase the normal level produced nine sentences with full stops, the
+  overdriven one a single run-on with commas, and a word went missing. Volume
+  does not help here, it hurts.
+- **Slow: ~9 seconds from “stop” to text (local engine).** Measured on this
+  Deck: model load ~0.9 s, everything else is the transcription. So a resident
+  process holding the model in memory would save under a second out of nine —
+  not the real bottleneck. The real one is model size: on the same recording
+  `small` takes 8.4 s and gets it right, `tiny` takes 1.4 s and confuses words.
+  Hence `small`. If more speed is needed without losing meaning, the thing to
+  try is a quantised `ggml-small-q5_1.bin` (~180 MB), not `tiny`.
+- **No GUI fallback.** Speech Note was removed — 3.9 GB and unused. If a GUI
+  recogniser is ever wanted: `flatpak install flathub net.mkiol.SpeechNote`
 
-- **В терминале не вставится.** Konsole не понимает Ctrl+V, там Ctrl+Shift+V.
-  Обходится через `PASTE_KEY="ctrl-shift-v"` в конфиге, но тогда сломается
-  вставка в обычные поля. Правильное решение — определять класс активного окна.
-- **Усиление микрофона выше 130% ломает распознавание.** Проба со 180%
-  дала клиппинг (`peak=1.0000`) на двух записях из шести, и текст поехал:
-  на одной и той же фразе нормальный уровень дал девять предложений с точками,
-  а перегруженный — одно сплошное с запятыми, и слово потерялось. Громкость
-  здесь не помогает, а вредит.
-- **Медленно: ~9 секунд от «стоп» до текста.** Замеры на этом Deck: загрузка
-  модели ~0,9 с, всё остальное — сам разбор. То есть резидентный процесс с
-  моделью в памяти сэкономит меньше секунды из девяти, это не главное узкое
-  место. Главное — вес модели: на одной и той же записи `small` даёт 8,4 с и
-  точный текст, `tiny` — 1,4 с, но путает слова («отписался» → «написался»,
-  «спам получил» → «я с вам получил»). Поэтому `small` и остаётся. Если
-  понадобится ускорение без потери смысла, пробовать надо квантованную
-  `ggml-small-q5_1.bin` (~180 МБ), а не `tiny`.
-- **Резервного варианта нет.** Speech Note удалён — он занимал 3,9 ГБ и не
-  использовался. Если понадобится GUI-распознавание, ставится обратно одной
-  командой: `flatpak install flathub net.mkiol.SpeechNote`
+## Next
 
-## Что дальше
-
-- [ ] Определение активного окна → правильная комбинация вставки
-- [ ] Квантованная `small-q5_1` — ускорить разбор, не теряя точность
-- [ ] Резидентный процесс с загруженной моделью (экономит ~0,9 с)
-- [x] Убрать залипающие уведомления — сделано, см. «Обратная связь»
-- [ ] Автопунктуация и заглавные буквы
+- [ ] Detect the focused window → pick the right paste combination
+- [ ] Quantised `small-q5_1` — faster transcription without losing accuracy
+- [ ] Resident process with the model preloaded (saves ~0.9 s)
+- [x] Stop notifications from sticking — done, see “Feedback”
+- [ ] Automatic punctuation and capitalisation
 
 ---
 
-## Мелочь, о которую легко споткнуться
+## One thing that is easy to trip over
 
-Горячая клавиша KDE привязывается **к имени файла ярлыка**, а не к команде.
-На этой машине привязка F12 исторически висит на `deck-dictation-toggle.desktop`,
-поэтому файл сохранил старое имя, хотя содержимое новое. Переименуешь — потеряешь
-сочетание клавиш и придётся назначать заново.
+A KDE shortcut binds **to the name of the desktop file**, not to the command.
+On this machine the F12 binding historically sits on
+`deck-dictation-toggle.desktop`, so the file kept its old name even though its
+contents are new. Rename it and the shortcut is lost, to be assigned again by
+hand.
 
-`install.sh` это учитывает: если в `kglobalshortcutsrc` уже есть привязка на
-старое имя, он пишет ярлык в него, а не заводит второй файл.
+`install.sh` accounts for this: if `kglobalshortcutsrc` already has a binding
+for the old name, it writes the entry into that file rather than creating a
+second one.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
