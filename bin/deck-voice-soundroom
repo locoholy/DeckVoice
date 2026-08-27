@@ -1,0 +1,97 @@
+#!/bin/bash
+# Шоу-рум звуковых тем: послушать все установленные и выбрать по номеру.
+#
+# Зачем отдельный скрипт, если в KDE есть окно настроек. В окне звуки
+# проигрываются по одному и по клику — сравнивать на слух неудобно, разница
+# между темами забывается, пока тыкаешь. Здесь они идут подряд, одинаковыми
+# звуками и с одинаковой громкостью, то есть слышно именно разницу.
+#
+# Темы ищутся и в системном каталоге, и в домашнем. Домашний важен: на SteamOS
+# корень только для чтения, поэтому свои темы кладутся в
+# ~/.local/share/sounds/ и работают оттуда без root.
+
+set -uo pipefail
+
+VOL="${VOL:-45000}"
+DIRS=("$HOME/.local/share/sounds" "/usr/share/sounds")
+
+# Те же звуки, которыми KDE показывает тему в настройках, плюс запасные —
+# набор у тем разный, играем первое, что нашлось.
+DEMO=(theme-demo bell audio-volume-change message dialog-information complete)
+
+declare -a NAMES PATHS
+
+find_themes() {
+  local d t
+  for d in "${DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    for t in "$d"/*/; do
+      [[ -f "$t/index.theme" ]] || continue
+      local id; id=$(basename "$t")
+      # одна и та же тема может лежать в обоих каталогах — берём первую
+      local seen=0 n
+      for n in "${NAMES[@]:-}"; do [[ "$n" == "$id" ]] && seen=1; done
+      (( seen )) && continue
+      NAMES+=("$id"); PATHS+=("$t")
+    done
+  done
+}
+
+# Первый существующий демо-звук темы
+sample() {
+  local dir="$1" s f
+  for s in "${DEMO[@]}"; do
+    for f in "$dir"stereo/"$s".*; do
+      [[ -r "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+  done
+  return 1
+}
+
+ms() {
+  LC_ALL=C ffprobe -v error -show_entries format=duration -of csv=p=0 "$1" 2>/dev/null \
+    | LC_ALL=C awk '{printf "%.0f", $1*1000}'
+}
+
+play_theme() {
+  local i="$1" dir="${PATHS[$1]}" name="${NAMES[$1]}" f
+  local title; title=$(grep -m1 '^Name=' "$dir/index.theme" 2>/dev/null | cut -d= -f2)
+  f=$(sample "$dir") || { printf '  %d) %-14s — звуков не нашлось\n' "$((i+1))" "$name"; return; }
+  printf '  %d) %-14s %-22s %4s мс\n' "$((i+1))" "$name" "${title:-$name}" "$(ms "$f")"
+  paplay --volume="$VOL" "$f" 2>/dev/null
+  sleep 0.85
+}
+
+# Куда пишется выбор. В самом модуле настроек имя ключа строкой не лежит,
+# поэтому оно установлено опытом: снят снимок конфигов, тема выбрана в окне
+# настроек, снимки сличены. Изменился ровно ~/.config/kdeglobals, группа
+# [Sounds], ключ Theme.
+apply() {
+  local id="$1"
+  kwriteconfig6 --file kdeglobals --group Sounds --key Theme "$id"
+  echo
+  echo "Записал тему «$id» в ~/.config/kdeglobals."
+  echo "Проверь в окне настроек, что выбор встал:  kcmshell6 kcm_soundtheme"
+  echo "Некоторые приложения подхватят её только после перезапуска сеанса."
+}
+
+find_themes
+(( ${#NAMES[@]} )) || { echo "тем не нашлось"; exit 1; }
+
+echo "Звуковые темы — слушаем подряд, одинаковой громкостью:"
+echo
+for i in "${!NAMES[@]}"; do play_theme "$i"; done
+
+echo
+if [[ "${1:-}" == "--apply" && -n "${2:-}" ]]; then
+  apply "$2"; exit 0
+fi
+
+printf 'Какую поставить? Номер, или Enter чтобы ничего не менять: '
+read -r choice
+[[ -z "$choice" ]] && { echo "Оставил как было."; exit 0; }
+if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#NAMES[@]} )); then
+  apply "${NAMES[$((choice-1))]}"
+else
+  echo "Не понял номер — ничего не менял."
+fi
